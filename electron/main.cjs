@@ -145,6 +145,22 @@ function queryMemoryFast(queryText = "") {
 
   const lines = [];
 
+  if (activeNewsCache && activeNewsCache.expiresAt && Date.now() < activeNewsCache.expiresAt) {
+    lines.push(
+      `=== ACTIVE TEMP CRAWLED NEWS CACHE (Topic: "${activeNewsCache.topic}" — Crawled from ${(activeNewsCache.websites || []).length} websites via Firecrawl) ===`
+    );
+    lines.push(
+      `IMPORTANT: If the user asks any follow-up question about "${activeNewsCache.topic}" or this news event, answer in a vivid, natural "What Happened" story format using the crawled article facts below. NEVER read URLs or links aloud!`
+    );
+    lines.push(`Synthesized Story: ${activeNewsCache.storyBriefing}`);
+    for (let i = 0; i < (activeNewsCache.websites || []).length; i++) {
+      const w = activeNewsCache.websites[i];
+      lines.push(
+        `\n[Crawled Website ${i + 1}: ${w.title} (${w.source})]\n${String(w.content || "").slice(0, 2000)}`
+      );
+    }
+  }
+
   if (addressList.length > 0) {
     lines.push("=== SAVED PROJECTS & ADDRESSES (INTERNAL REFERENCE ONLY — DO NOT READ PATHS OR TIMESTAMPS ALOUD) ===");
     for (const item of addressList) {
@@ -306,10 +322,844 @@ function sendWakeCommand(payload, timeoutMs = 4000) {
     });
     }
 
-    // Cache Vertex AI token for fast multi-turn requests
+    // Cache Vertex AI token & GCP YouTube Data API v3 key
     let cachedVertexAuth = { token: null, project: null, expiresAt: 0 };
+    let cachedYouTubeApiKey = process.env.YOUTUBE_API_KEY || null;
 
-    async function getVertexCredentials() {
+    async function getYouTubeApiKey() {
+      if (cachedYouTubeApiKey) return cachedYouTubeApiKey;
+      const userEnvRes = await runPowerShell(
+        '[Environment]::GetEnvironmentVariable("YOUTUBE_API_KEY", "User")',
+        4000
+      );
+      if (userEnvRes.ok && userEnvRes.stdout && userEnvRes.stdout.startsWith("AIza")) {
+        cachedYouTubeApiKey = userEnvRes.stdout.trim();
+        return cachedYouTubeApiKey;
+      }
+      const gcloudRes = await runPowerShell(
+        '$k = (gcloud services api-keys list --filter="displayName=\'Jarvis YouTube API\'" --format="value(name)" | Select-Object -First 1); if ($k) { gcloud services api-keys get-key-string $k --format="value(keyString)" }',
+        7000
+      );
+      if (gcloudRes.ok && gcloudRes.stdout && gcloudRes.stdout.includes("AIza")) {
+        cachedYouTubeApiKey = gcloudRes.stdout.split(String.fromCharCode(10)).pop().trim();
+        return cachedYouTubeApiKey;
+      }
+      return null;
+    }
+
+    function cleanYouTubeSongTitle(rawTitle = "", channelTitle = "") {
+      const decoded = rawTitle
+        .replace(/&amp;/g, "&")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'");
+
+      // Strip common YouTube video noise tags
+      const stripped = decoded
+        .replace(
+          /\([^)]*(?:official|lyric|video|audio|4k|8k|hd|full\s*song|visualizer|remaster|title|jukebox|best|slowed|reverb|\d{4})[^)]*\)/gi,
+          " "
+        )
+        .replace(
+          /\[[^\]]*(?:official|lyric|video|audio|4k|8k|hd|full\s*song|visualizer|remaster|title|jukebox|best|slowed|reverb|\d{4})[^\]]*\]/gi,
+          " "
+        )
+        .replace(
+          /\b(?:official\s*(?:music\s*)?video|lyric(?:s)?\s*video|full\s*video\s*song|full\s*song|video\s*song|audio\s*song|4k\s*ultra\s*hd|8k|4k|hd|hq|jukebox|non\s*stop|back\s*to\s*back|superhit\s*hindi\s*song|songs|song|title\s*track|video)\b/gi,
+          " "
+        );
+
+      const parts = stripped
+        .split(/[|\-–—:]/)
+        .map((p) =>
+          p
+            .replace(/[^a-zA-Z0-9\s']/g, " ")
+            .replace(/\s+/g, " ")
+            .trim()
+        )
+        .filter((p) => p.length >= 2);
+
+      // Take primary song title + movie/singer segment from YouTube's official metadata
+      const cleanedQuery = parts.slice(0, 2).join(" ") || stripped.replace(/\s+/g, " ").trim();
+      const primaryTitle = parts[0] || cleanedQuery;
+      const secondaryContext = parts[1] || channelTitle.replace(/VEVO|Official|Music|Records|Series|India|Films/gi, "").trim();
+
+      return {
+        cleanedQuery,
+        primaryTitle,
+        secondaryContext,
+      };
+    }
+
+    /**
+     * Resolves hummed/sung lyrics, Hindi/Devanagari phrases, movie names, or partial song descriptions
+     * into the official Romanized song title and artist using GCP YouTube Data API v3 (regionCode=IN).
+     */
+    async function resolveSongViaYouTubeAPI(lyricsOrQuery) {
+      const ytKey = await getYouTubeApiKey();
+      const searchQuery = /song|music|track/i.test(lyricsOrQuery)
+        ? lyricsOrQuery
+        : `${lyricsOrQuery} song`;
+
+      let videoId = null;
+      let ytTitle = "";
+      let ytChannel = "";
+
+      if (ytKey) {
+        try {
+          const ytUrl = `https://youtube.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&regionCode=IN&maxResults=3&q=${encodeURIComponent(
+            searchQuery
+          )}&key=${encodeURIComponent(ytKey)}`;
+          const resp = await fetch(ytUrl);
+          if (resp.ok) {
+            const data = await resp.json();
+            const top = data?.items?.[0];
+            if (top) {
+              videoId = top.id?.videoId || null;
+              ytTitle = top.snippet?.title || "";
+              ytChannel = top.snippet?.channelTitle || "";
+            }
+          }
+        } catch {
+          // fall through to HTML fallback
+        }
+      }
+
+      // Fallback to YouTube HTML search if API quota or network failed
+      if (!videoId) {
+        try {
+          const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(searchQuery)}`;
+          const resp = await fetch(searchUrl, {
+            headers: {
+              "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            },
+          });
+          const html = await resp.text();
+          const idMatch = html.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
+          const titleMatch = html.match(/"title":\{"runs":\[\{"text":"([^"]+)"\}/);
+          if (idMatch) videoId = idMatch[1];
+          if (titleMatch) ytTitle = titleMatch[1];
+        } catch {
+          // ignore
+        }
+      }
+
+      const { cleanedQuery, primaryTitle, secondaryContext } = cleanYouTubeSongTitle(
+        ytTitle || lyricsOrQuery,
+        ytChannel
+      );
+
+      return {
+        videoId,
+        youtubeTitle: ytTitle || primaryTitle,
+        officialSongName: primaryTitle || lyricsOrQuery,
+        officialArtist: secondaryContext || "",
+        spotifySearchQuery: cleanedQuery || lyricsOrQuery,
+      };
+    }
+
+    // ============================================================================
+    // SPOTIFY DEVELOPER API & PREMIUM OAUTH 2.0 CONTROLLER
+    // ============================================================================
+    const SPOTIFY_CONFIG_FILE = path.join(MEMORY_DIR, "spotify_config.json");
+    const SPOTIFY_TOKEN_FILE = path.join(MEMORY_DIR, "spotify_tokens.json");
+    let spotifyCallbackServer = null;
+
+    function getSpotifyCredentials() {
+      let fileCfg = {};
+      try {
+        if (fs.existsSync(SPOTIFY_CONFIG_FILE)) {
+          fileCfg = JSON.parse(fs.readFileSync(SPOTIFY_CONFIG_FILE, "utf8"));
+        }
+      } catch {
+        // ignore
+      }
+      return {
+        clientId: process.env.SPOTIFY_CLIENT_ID || fileCfg.clientId || "",
+        clientSecret: process.env.SPOTIFY_CLIENT_SECRET || fileCfg.clientSecret || "",
+        redirectUri: "http://127.0.0.1:8888/callback",
+      };
+    }
+
+    async function getSpotifyAccessToken() {
+      const { clientId, clientSecret } = getSpotifyCredentials();
+      if (!clientId || !clientSecret) return { token: null, isUserToken: false };
+
+      // 1. Check saved user OAuth token (for Spotify Premium /v1/me/player/play)
+      try {
+        if (fs.existsSync(SPOTIFY_TOKEN_FILE)) {
+          const saved = JSON.parse(fs.readFileSync(SPOTIFY_TOKEN_FILE, "utf8"));
+          if (saved.access_token && saved.expires_at && Date.now() < saved.expires_at - 30000) {
+            return { token: saved.access_token, isUserToken: true };
+          }
+          if (saved.refresh_token) {
+            const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+            const resp = await fetch("https://accounts.spotify.com/api/token", {
+              method: "POST",
+              headers: {
+                Authorization: `Basic ${basic}`,
+                "Content-Type": "application/x-www-form-urlencoded",
+              },
+              body: new URLSearchParams({
+                grant_type: "refresh_token",
+                refresh_token: saved.refresh_token,
+              }),
+            });
+            if (resp.ok) {
+              const data = await resp.json();
+              const updated = {
+                ...saved,
+                access_token: data.access_token,
+                refresh_token: data.refresh_token || saved.refresh_token,
+                expires_at: Date.now() + (data.expires_in || 3600) * 1000,
+              };
+              fs.writeFileSync(SPOTIFY_TOKEN_FILE, JSON.stringify(updated, null, 2), "utf8");
+              return { token: updated.access_token, isUserToken: true };
+            }
+          }
+        }
+      } catch {
+        // fall through to client_credentials
+      }
+
+      // 2. Client Credentials token (for /v1/search exact Track ID resolution)
+      try {
+        const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+        const resp = await fetch("https://accounts.spotify.com/api/token", {
+          method: "POST",
+          headers: {
+            Authorization: `Basic ${basic}`,
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: new URLSearchParams({ grant_type: "client_credentials" }),
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          return { token: data.access_token, isUserToken: false };
+        }
+      } catch {
+        // ignore
+      }
+      return { token: null, isUserToken: false };
+    }
+
+    function startSpotifyOAuthServer() {
+      const { clientId, clientSecret, redirectUri } = getSpotifyCredentials();
+      if (!clientId || !clientSecret) {
+        return {
+          ok: false,
+          message:
+            "Please set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in your environment or memory/spotify_config.json first.",
+        };
+      }
+
+      if (!spotifyCallbackServer) {
+        const http = require("node:http");
+        spotifyCallbackServer = http.createServer(async (req, res) => {
+          const reqUrl = new URL(req.url, "http://127.0.0.1:8888");
+          if (reqUrl.pathname === "/callback") {
+            const code = reqUrl.searchParams.get("code");
+            if (code) {
+              try {
+                const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+                const tokenResp = await fetch("https://accounts.spotify.com/api/token", {
+                  method: "POST",
+                  headers: {
+                    Authorization: `Basic ${basic}`,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                  },
+                  body: new URLSearchParams({
+                    grant_type: "authorization_code",
+                    code,
+                    redirect_uri: redirectUri,
+                  }),
+                });
+                const tokenData = await tokenResp.json();
+                if (tokenData.access_token) {
+                  fs.writeFileSync(
+                    SPOTIFY_TOKEN_FILE,
+                    JSON.stringify(
+                      {
+                        ...tokenData,
+                        expires_at: Date.now() + (tokenData.expires_in || 3600) * 1000,
+                      },
+                      null,
+                      2
+                    ),
+                    "utf8"
+                  );
+                  res.writeHead(200, { "Content-Type": "text/html" });
+                  res.end(
+                    "<body style='background:#09090b;color:#22d3ee;font-family:sans-serif;text-align:center;padding-top:20%'><h1>J.A.R.V.I.S. // Spotify Premium Connected</h1><p>You can close this tab now, sir.</p></body>"
+                  );
+                  return;
+                }
+              } catch {
+                // ignore
+              }
+            }
+            res.writeHead(400);
+            res.end("Spotify authorization failed.");
+          }
+        });
+        spotifyCallbackServer.listen(8888, "127.0.0.1");
+      }
+
+      const scopes =
+        "user-modify-playback-state user-read-playback-state user-read-currently-playing streaming";
+      const authUrl = `https://accounts.spotify.com/authorize?response_type=code&client_id=${encodeURIComponent(
+        clientId
+      )}&scope=${encodeURIComponent(scopes)}&redirect_uri=${encodeURIComponent(redirectUri)}`;
+
+      const chromePath = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+      if (fs.existsSync(chromePath)) {
+        spawn(chromePath, [authUrl], { detached: true, stdio: "ignore" }).unref();
+      } else {
+        shell.openExternal(authUrl);
+      }
+      return { ok: true, message: "Opened Spotify Premium authorization in Chrome." };
+    }
+
+    // ============================================================================
+// AZURE GLOBE NEWS API (gdelt-timeline-proxy-rk2026) & PROACTIVE TOPIC SENTINEL
+// ============================================================================
+const GLOBE_NEWS_BASE_URL = "https://gdelt-timeline-proxy-rk2026.azurewebsites.net/api";
+const NEWS_WATCHES_FILE = path.join(MEMORY_DIR, "news_watches.json");
+const FIRECRAWL_CONFIG_FILE = path.join(MEMORY_DIR, "firecrawl_config.json");
+const NEWS_TEMP_CACHE_FILE = path.join(MEMORY_DIR, "news_temp_cache.json");
+let cachedGlobeTimeline = { slotKey: "", items: [], fetchedAt: 0 };
+let newsWatches = [];
+let activeNewsCache = null;
+
+function loadActiveNewsCache() {
+  try {
+    if (fs.existsSync(NEWS_TEMP_CACHE_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(NEWS_TEMP_CACHE_FILE, "utf8"));
+      if (parsed && parsed.expiresAt && Date.now() < parsed.expiresAt) {
+        activeNewsCache = parsed;
+      }
+    }
+  } catch {
+    activeNewsCache = null;
+  }
+}
+loadActiveNewsCache();
+
+function getFirecrawlApiKey() {
+  if (process.env.FIRECRAWL_API_KEY) return process.env.FIRECRAWL_API_KEY;
+  try {
+    if (fs.existsSync(FIRECRAWL_CONFIG_FILE)) {
+      const cfg = JSON.parse(fs.readFileSync(FIRECRAWL_CONFIG_FILE, "utf8"));
+      return cfg.apiKey || "";
+    }
+  } catch {
+    // ignore
+  }
+  return "";
+}
+
+function cleanFirecrawlMarkdown(rawMd = "") {
+  const noImgs = String(rawMd || "")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/https?:\/\/\S+/g, " ");
+
+  const lines = [];
+  for (const rawLine of noImgs.split(/\r?\n/)) {
+    const s = rawLine.replace(/\s+/g, " ").trim();
+    if (
+      s.length >= 50 &&
+      !/^(?:edition\b|advertisement\b|skip to\b|follow us\b|sign in\b|subscribe\b|copyright\b|all rights reserved|arrow-down)/i.test(
+        s
+      ) &&
+      !s.startsWith("|")
+    ) {
+      lines.push(s);
+    }
+    if (lines.length >= 22) break;
+  }
+  return lines.join("\n").slice(0, 3200);
+}
+
+/**
+ * Crawls 2-3 news websites on the given topic in parallel using Firecrawl (/v1/search with markdown scrape)
+ * + Azure Globe News, stores the full article bodies in the Temporary News Cache (memory/news_temp_cache.json),
+ * and synthesizes a natural "What Happened" story briefing without reading any links/URLs out loud.
+ */
+async function crawlAndSynthesizeNewsStory(rawTopic = "", languageCode = "en-IN") {
+  const { cleanPhrase } = extractSignificantTopicWords(rawTopic);
+  const searchTopic = cleanPhrase || "India and World";
+  const fcKey = getFirecrawlApiKey();
+
+  const crawledWebsites = [];
+
+  // 1. Crawl top 3 news websites in parallel via Firecrawl API (/v1/search with markdown extraction)
+  if (fcKey) {
+    try {
+      const fcResp = await fetch("https://api.firecrawl.dev/v1/search", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${fcKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          query: `${searchTopic} latest news -site:youtube.com`,
+          limit: 3,
+          scrapeOptions: {
+            formats: ["markdown"],
+            onlyMainContent: true,
+          },
+        }),
+      });
+      if (fcResp.ok) {
+        const fcData = await fcResp.json();
+        const items = Array.isArray(fcData?.data) ? fcData.data : [];
+        for (const item of items.slice(0, 3)) {
+          const cleanBody = cleanFirecrawlMarkdown(item.markdown || item.description || "");
+          if (cleanBody || item.title) {
+            let domain = "News Source";
+            try {
+              domain = new URL(item.url).hostname.replace(/^www\./, "");
+            } catch {
+              // ignore
+            }
+            crawledWebsites.push({
+              title: item.title || searchTopic,
+              source: domain,
+              url: item.url || "",
+              content: cleanBody || item.description || item.title || "",
+            });
+          }
+        }
+      }
+    } catch {
+      // fall through to searchGlobeNews backup
+    }
+  }
+
+  // 2. Also include Azure Globe News / RSS matches if Firecrawl returned fewer than 2 sites
+  if (crawledWebsites.length < 2) {
+    const globeHits = await searchGlobeNews(searchTopic);
+    for (const h of globeHits.slice(0, 3 - crawledWebsites.length)) {
+      crawledWebsites.push({
+        title: h.headline,
+        source: h.source,
+        url: h.url,
+        content: `${h.headline} (${h.place}, reported by ${h.source})`,
+      });
+    }
+  }
+
+  if (crawledWebsites.length === 0) {
+    return {
+      ok: true,
+      topic: searchTopic,
+      storyBriefing: `Sir, I checked Globe News and crawled live news sources, but there are no breaking stories on "${searchTopic}" right now.`,
+      websites: [],
+    };
+  }
+
+  // 3. Synthesize a vivid 3-4 sentence "What Happened" story across the 2-3 crawled websites!
+  const isHindi = languageCode === "hi-IN" || languageCode === "mr-IN";
+  const multiSourceContext = crawledWebsites
+    .map(
+      (w, idx) =>
+        `--- WEBSITE ${idx + 1}: ${w.title} (${w.source}) ---\n${w.content.slice(0, 2200)}`
+    )
+    .join("\n\n");
+
+  const synthesisPrompt = `You are J.A.R.V.I.S., Rakesh's personal AI intelligence officer.
+You have just crawled ${crawledWebsites.length} news websites about "${searchTopic}".
+Synthesize the facts across all ${crawledWebsites.length} websites into a clear, engaging 3-to-4 sentence "What Happened" story briefing:
+1. Explain clearly WHAT happened, WHERE and WHEN it happened, WHO is involved, and the latest update/outcome.
+2. Tell it like a natural story ("Sir, here is what happened..." or in Hinglish "Sir, ${searchTopic} को लेकर बड़ी खबर यह है कि...").
+3. Language: ${
+    isHindi
+      ? "Speak in natural conversational Hinglish (Hindi in Devanagari mixed with English words like sir, police, hospital, security, update)."
+      : "Speak in crisp, natural English."
+  }
+4. STRICT RULE: NEVER read any URLs, web links, domain names, or markdown formatting out loud! Plain spoken sentences only.`;
+
+  let storyBriefing = "";
+
+  // Try Vertex AI gemini-2.5-flash (thinkingBudget: 0) first for ultra-fast multi-article synthesis
+  try {
+    const auth = await getVertexCredentials();
+    if (auth.token && auth.project) {
+      const endpoint = `https://aiplatform.googleapis.com/v1beta1/projects/${auth.project}/locations/global/publishers/google/models/gemini-2.5-flash:generateContent`;
+      const vResp = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${auth.token}`,
+          "Content-Type": "application/json",
+          "x-goog-user-project": auth.project,
+        },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: synthesisPrompt }] },
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  text: `Crawled News Websites on "${searchTopic}":\n\n${multiSourceContext}\n\nGive me the 3-4 sentence "What Happened" story briefing now:`,
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.35,
+            maxOutputTokens: 320,
+            thinkingConfig: { thinkingBudget: 0 },
+          },
+        }),
+      });
+      if (vResp.ok) {
+        const vData = await vResp.json();
+        storyBriefing = (
+          vData?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || ""
+        )
+          .replace(/\[LANG:[a-z]{2}-[A-Z]{2}\]/gi, "")
+          .replace(/[*#_`~]+/g, "")
+          .trim();
+      }
+    }
+  } catch {
+    // fallback to Sarvam sarvam-105b
+  }
+
+  if (!storyBriefing) {
+    try {
+      const sKey = getSarvamKey();
+      const sResp = await fetch("https://api.sarvam.ai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "api-subscription-key": sKey,
+          Authorization: `Bearer ${sKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "sarvam-105b",
+          messages: [
+            { role: "system", content: synthesisPrompt },
+            {
+              role: "user",
+              content: `Crawled News Websites on "${searchTopic}":\n\n${multiSourceContext}\n\nGive me the 3-4 sentence "What Happened" story briefing now:`,
+            },
+          ],
+          temperature: 0.35,
+          max_tokens: 320,
+        }),
+      });
+      if (sResp.ok) {
+        const sData = await sResp.json();
+        storyBriefing = (sData?.choices?.[0]?.message?.content || "")
+          .replace(/<think>[\s\S]*?<\/think>/gi, "")
+          .replace(/[*#_`~]+/g, "")
+          .trim();
+      }
+    } catch {
+      // fallback to top article summary
+    }
+  }
+
+  if (!storyBriefing) {
+    const first = crawledWebsites[0];
+    storyBriefing = `Sir, here is what happened regarding ${searchTopic}: ${first.title}. ${first.content
+      .split("\n")
+      .slice(0, 2)
+      .join(" ")}`;
+  }
+
+  // 4. Save crawled websites + synthesized story in the Temporary News Cache (valid for 30 minutes for follow-up Q&A!)
+  activeNewsCache = {
+    topic: searchTopic,
+    fetchedAt: formatFullTimestamp(new Date()),
+    expiresAt: Date.now() + 30 * 60 * 1000,
+    storyBriefing,
+    websites: crawledWebsites,
+  };
+  try {
+    fs.writeFileSync(NEWS_TEMP_CACHE_FILE, JSON.stringify(activeNewsCache, null, 2), "utf8");
+  } catch {
+    // ignore
+  }
+
+  // Also record primary article URL silently in memory ledger in case user asks "open that article in Chrome"
+  if (crawledWebsites[0]?.url) {
+    memoryState.addresses[`news:${searchTopic}`] = {
+      key: `news:${searchTopic}`,
+      toolName: "get_globe_news",
+      address: crawledWebsites[0].url,
+      summary: storyBriefing,
+      agent: "firecrawl-globe-news",
+      timestamp: formatFullTimestamp(new Date()),
+      isoTimestamp: new Date().toISOString(),
+    };
+    saveMemoryToDiskAsync();
+  }
+
+  return {
+    ok: true,
+    topic: searchTopic,
+    storyBriefing,
+    websitesCount: crawledWebsites.length,
+    websites: crawledWebsites.map((w) => ({ title: w.title, source: w.source, url: w.url })),
+    address: crawledWebsites[0]?.url || "",
+    message: storyBriefing,
+  };
+}
+
+function loadNewsWatches() {
+  try {
+    if (fs.existsSync(NEWS_WATCHES_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(NEWS_WATCHES_FILE, "utf8"));
+      if (Array.isArray(raw)) newsWatches = raw;
+    }
+  } catch {
+    newsWatches = [];
+  }
+}
+
+function saveNewsWatches() {
+  try {
+    fs.writeFileSync(NEWS_WATCHES_FILE, JSON.stringify(newsWatches, null, 2), "utf8");
+  } catch {
+    // ignore
+  }
+}
+
+loadNewsWatches();
+
+function getLatestGdeltSlot(offsetMinutes = 15) {
+  const dt = new Date(Date.now() - offsetMinutes * 60 * 1000);
+  const yyyy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(dt.getUTCDate()).padStart(2, "0");
+  const hh = String(dt.getUTCHours()).padStart(2, "0");
+  const slotMin = String(Math.floor(dt.getUTCMinutes() / 15) * 15).padStart(2, "0");
+  return { date: `${yyyy}-${mm}-${dd}`, time: `${hh}:${slotMin}` };
+}
+
+async function fetchGlobeTimelineSlot() {
+  const now = Date.now();
+  const slot1 = getLatestGdeltSlot(15);
+  const slotKey = `${slot1.date}_${slot1.time}`;
+  if (
+    cachedGlobeTimeline.slotKey === slotKey &&
+    cachedGlobeTimeline.items.length > 0 &&
+    now - cachedGlobeTimeline.fetchedAt < 60 * 1000
+  ) {
+    return cachedGlobeTimeline.items;
+  }
+
+  for (const offset of [15, 30, 45]) {
+    const s = getLatestGdeltSlot(offset);
+    try {
+      const url = `${GLOBE_NEWS_BASE_URL}/timeline-news?date=${s.date}&time=${s.time}`;
+      const resp = await fetch(url);
+      if (resp.ok) {
+        const items = await resp.json();
+        if (Array.isArray(items) && items.length > 0) {
+          cachedGlobeTimeline = {
+            slotKey: `${s.date}_${s.time}`,
+            items,
+            fetchedAt: now,
+          };
+          return items;
+        }
+      }
+    } catch {
+      // try previous 15-min slot
+    }
+  }
+  return cachedGlobeTimeline.items || [];
+}
+
+const NEWS_STOPWORDS = new Set([
+  "is", "there", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+  "do", "does", "did", "will", "would", "shall", "should", "may", "might", "must", "can", "could",
+  "the", "a", "an", "and", "or", "but", "if", "then", "else", "when", "whenever", "where", "why", "how",
+  "what", "whats", "which", "who", "whom", "whose", "this", "that", "these", "those",
+  "any", "some", "all", "no", "not", "only", "own", "same", "so", "than", "too", "very",
+  "in", "on", "at", "by", "for", "with", "about", "against", "between", "into", "through",
+  "during", "before", "after", "above", "below", "to", "from", "up", "down", "of", "off", "over", "under",
+  "related", "relating", "regarding", "concerning", "connected", "associated", "pertaining",
+  "news", "latest", "breaking", "recent", "new", "current", "today", "todays", "update", "updates",
+  "headline", "headlines", "story", "stories", "report", "reports", "globe", "tell", "me", "give", "show",
+  "inform", "notify", "alert", "watch", "monitor", "comes", "come", "coming", "happening", "going",
+  "please", "sir", "jarvis", "hey", "hi", "ok", "okay",
+  "क्या", "कोई", "है", "हैं", "में", "पर", "पे", "की", "का", "के", "को", "से", "तो", "अगर", "जब", "भी",
+  "खबर", "खबरें", "न्यूज़", "समाचार", "ताज़ा", "आज", "मुझे", "बताना", "बताओ", "सुनाओ",
+]);
+
+function extractSignificantTopicWords(rawText = "") {
+  const cleaned = String(rawText || "")
+    .replace(/['’]s\b/gi, "")
+    .replace(/[?!.,;:"'()[\]{}|/\\]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const words = cleaned
+    .split(" ")
+    .map((w) => w.trim())
+    .filter((w) => w.length >= 2 && !NEWS_STOPWORDS.has(w.toLowerCase()));
+
+  return {
+    cleanPhrase: words.join(" ").trim(),
+    keywords: words.map((w) => w.toLowerCase()).filter((w) => w.length >= 3),
+  };
+}
+
+function escapeRegExpStr(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function searchGlobeNews(topic = "") {
+  const { cleanPhrase, keywords } = extractSignificantTopicWords(topic);
+  const timelineItems = await fetchGlobeTimelineSlot();
+
+  // If user asked for general global/world news without a specific topic
+  if (
+    !cleanPhrase ||
+    keywords.length === 0 ||
+    /^(?:world|global|international|all)$/i.test(cleanPhrase)
+  ) {
+    return timelineItems.slice(0, 6).map((item) => ({
+      id: item.id || item.url,
+      headline: item.headline,
+      place: item.place || item.country || "Global",
+      source: item.source || "Globe News",
+      url: item.url,
+      origin: "Azure Globe News (GDELT)",
+    }));
+  }
+
+  // 1. Search Azure Globe News GDELT 15-minute slot using WHOLE-WORD matching (ALL keywords must match)
+  const wordRegexes = keywords.map((kw) => new RegExp(`\\b${escapeRegExpStr(kw)}\\b`, "i"));
+  const matched = [];
+
+  for (const item of timelineItems) {
+    const hay = `${item.headline || ""} ${item.place || ""}`;
+    // Require ALL topic keywords to appear as whole words in the headline or place
+    if (wordRegexes.every((rx) => rx.test(hay))) {
+      matched.push({
+        id: item.id || item.url,
+        headline: item.headline,
+        place: item.place || item.country || cleanPhrase,
+        source: item.source || "Globe News",
+        url: item.url,
+        origin: "Azure Globe News (GDELT)",
+      });
+    }
+  }
+
+  // 2. Query real-time topic news stream for exact phrase / person / subject if GDELT 15-min window didn't have it
+  if (matched.length < 3) {
+    try {
+      const rssUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(
+        cleanPhrase
+      )}&hl=en-IN&gl=IN&ceid=IN:en`;
+      const rssResp = await fetch(rssUrl);
+      if (rssResp.ok) {
+        const xml = await rssResp.text();
+        const itemRegex = /<item>([\s\S]*?)<\/item>/g;
+        let m;
+        while ((m = itemRegex.exec(xml)) !== null && matched.length < 6) {
+          const block = m[1];
+          const titleMatch = block.match(/<title>([\s\S]*?)<\/title>/);
+          const linkMatch = block.match(/<link>([\s\S]*?)<\/link>/);
+          const sourceMatch = block.match(/<source[^>]*>([\s\S]*?)<\/source>/);
+          if (titleMatch) {
+            const rawTitle = titleMatch[1]
+              .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+              .replace(/&amp;/g, "&")
+              .replace(/&quot;/g, '"')
+              .replace(/&#39;/g, "'")
+              .replace(/\s+-\s+[^-]+$/, "")
+              .trim();
+            const link = linkMatch ? linkMatch[1].trim() : "";
+            const src = sourceMatch ? sourceMatch[1].trim() : "Globe News Feed";
+            // Verify at least one significant topic keyword appears in the headline
+            if (wordRegexes.some((rx) => rx.test(rawTitle)) || matched.length === 0) {
+              matched.push({
+                id: link || rawTitle,
+                headline: rawTitle,
+                place: cleanPhrase,
+                source: src,
+                url: link,
+                origin: "Globe News Live Topic Stream",
+              });
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore fallback error
+    }
+  }
+
+  return matched.slice(0, 6);
+}
+
+async function checkNewsWatchesAndNotify(specificWatchId = null) {
+  if (!mainWindow || newsWatches.length === 0) return;
+
+  for (const watch of newsWatches) {
+    if (specificWatchId && watch.id !== specificWatchId) continue;
+    try {
+      const articles = await searchGlobeNews(watch.topic);
+      if (!articles || articles.length === 0) continue;
+
+      const unseen = articles.find((a) => !watch.seenIds.includes(a.id));
+      if (unseen) {
+        watch.seenIds.push(unseen.id);
+        if (watch.seenIds.length > 100) watch.seenIds = watch.seenIds.slice(-100);
+        watch.lastNotifiedAt = formatFullTimestamp(new Date());
+        saveNewsWatches();
+
+        // Save article URL into persistent memory address ledger so user can say "Open that news article"
+        if (unseen.url) {
+          memoryState.addresses[`news:${watch.topic}`] = {
+            key: `news:${watch.topic}`,
+            toolName: "get_globe_news",
+            address: unseen.url,
+            summary: `Breaking Globe News on "${watch.topic}": ${unseen.headline}`,
+            agent: "globe-news",
+            timestamp: formatFullTimestamp(new Date()),
+            isoTimestamp: new Date().toISOString(),
+          };
+          saveMemoryToDiskAsync();
+        }
+
+        // Crawl 2-3 websites via Firecrawl & cache the full story so the proactive alert tells the full 'What Happened' story and supports follow-up questions!
+        const crawledStory = await crawlAndSynthesizeNewsStory(
+          watch.topic,
+          watch.languageCode || "en-IN"
+        );
+
+        mainWindow.webContents.send("jarvis:newsAlert", {
+          watchId: watch.id,
+          topic: watch.topic,
+          headline: crawledStory?.storyBriefing || unseen.headline,
+          place: unseen.place,
+          source: unseen.source,
+          url: unseen.url,
+          languageCode: watch.languageCode || "en-IN",
+        });
+        break;
+      }
+    } catch {
+      // ignore single watch error
+    }
+  }
+}
+
+// Poll watched Globe News topics every 60 seconds in the background
+setInterval(() => {
+  checkNewsWatchesAndNotify().catch(() => {});
+}, 60 * 1000);
+
+async function getVertexCredentials() {
     const now = Date.now();
     if (cachedVertexAuth.token && now < cachedVertexAuth.expiresAt) {
     return cachedVertexAuth;
@@ -380,6 +1230,34 @@ function createMainWindow() {
   mainWindow.setIgnoreMouseEvents(true, { forward: true });
   mainWindow.on("will-resize", (e) => e.preventDefault());
   mainWindow.on("page-title-updated", (e) => e.preventDefault());
+
+  // Permanently clip the window to a clean circle (x: 24..296, y: 38..310) ONCE at startup
+  // so Windows DWM can NEVER draw a top titlebar strip at y=0..37, while CSS handles all animations at 120fps!
+  const applyCleanCircleClip = () => {
+    if (!mainWindow) return;
+    try {
+      const hwndBuf = mainWindow.getNativeWindowHandle();
+      const hwndVal =
+        hwndBuf.length >= 8 ? Number(hwndBuf.readBigInt64LE(0)) : hwndBuf.readInt32LE(0);
+      const clipCmd = `
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinClip {
+  [DllImport("gdi32.dll")] public static extern IntPtr CreateEllipticRgn(int l, int t, int r, int b);
+  [DllImport("user32.dll")] public static extern int SetWindowRgn(IntPtr hWnd, IntPtr hRgn, bool bRedraw);
+}
+"@
+$rgn = [WinClip]::CreateEllipticRgn(24, 38, 296, 310)
+[void][WinClip]::SetWindowRgn([IntPtr]${hwndVal}, $rgn, $true)
+`;
+      runPowerShell(clipCmd, 3000);
+    } catch {
+      // ignore
+    }
+  };
+  applyCleanCircleClip();
+  mainWindow.webContents.on("did-finish-load", applyCleanCircleClip);
 
   // Auto-grant microphone, camera, and screen capture permissions
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
@@ -488,10 +1366,7 @@ ipcMain.handle("window:setOrbVisible", (_e, visible) => {
   const show = Boolean(visible);
   try {
     if (show) {
-      mainWindow.setIgnoreMouseEvents(false);
       mainWindow.setAlwaysOnTop(true, "screen-saver");
-    } else {
-      mainWindow.setIgnoreMouseEvents(true, { forward: true });
     }
   } catch {
     // ignore
@@ -670,18 +1545,10 @@ ipcMain.handle("system:executeTool", async (_e, { toolName, args = {} }) => {
       const query = String(args.query || "").trim();
       if (!query) return { ok: false, message: "No song or video specified." };
       try {
-        const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
-        const resp = await fetch(searchUrl, {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-          },
-        });
-        const html = await resp.text();
-        const match = html.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
-        const targetUrl = match
-          ? `https://www.youtube.com/watch?v=${match[1]}&autoplay=1`
-          : searchUrl;
+        const resolved = await resolveSongViaYouTubeAPI(query);
+        const targetUrl = resolved.videoId
+          ? `https://www.youtube.com/watch?v=${resolved.videoId}&autoplay=1`
+          : `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
 
         const chromePath = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
         if (fs.existsSync(chromePath)) {
@@ -692,12 +1559,140 @@ ipcMain.handle("system:executeTool", async (_e, { toolName, args = {} }) => {
         return {
           ok: true,
           query,
+          officialSongName: resolved.officialSongName,
+          officialArtist: resolved.officialArtist,
           url: targetUrl,
-          message: `Playing "${query}" on YouTube in Chrome.`,
+          address: targetUrl,
+          message: `Playing "${resolved.officialSongName}"${resolved.officialArtist ? " by " + resolved.officialArtist : ""} on YouTube in Chrome.`,
         };
       } catch (err) {
         return { ok: false, error: err.message };
       }
+    }
+
+    case "play_spotify": {
+      const rawLyricsOrQuery = String(args.query || args.lyrics || "").trim();
+      if (!rawLyricsOrQuery) return { ok: false, message: "No lyrics or song specified." };
+
+      try {
+        // Step 1: Resolve lyrics / hummed phrase via GCP YouTube Data API v3 -> Official Song Name & Artist
+        const resolved = await resolveSongViaYouTubeAPI(rawLyricsOrQuery);
+        const spotifyQuery = resolved.spotifySearchQuery;
+
+        // Step 2: Query Spotify Developer API (/v1/search) for exact Spotify Track URI (spotify:track:<id>)
+        const { token, isUserToken } = await getSpotifyAccessToken();
+        let trackUri = null;
+        let trackId = null;
+        let trackTitle = resolved.officialSongName;
+        let trackArtist = resolved.officialArtist;
+
+        if (token) {
+          const sResp = await fetch(
+            `https://api.spotify.com/v1/search?type=track&market=IN&limit=1&q=${encodeURIComponent(spotifyQuery)}`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          if (sResp.ok) {
+            const sData = await sResp.json();
+            const track = sData?.tracks?.items?.[0];
+            if (track) {
+              trackUri = track.uri;
+              trackId = track.id;
+              trackTitle = track.name || trackTitle;
+              trackArtist = track.artists?.map((a) => a.name).join(", ") || trackArtist;
+            }
+          }
+
+          // Step 3A: If authenticated with Spotify Premium user token, play via /v1/me/player/play on the Windows PC device
+          if (isUserToken && trackUri) {
+            // Ensure Windows Spotify app is running
+            const procCheck = await runPowerShell(
+              '(Get-Process -Name Spotify -ErrorAction SilentlyContinue) -ne $null',
+              2500
+            );
+            if (procCheck.stdout !== "True") {
+              await shell.openExternal("spotify:");
+              await new Promise((r) => setTimeout(r, 2200));
+            }
+
+            // Find active or available Windows device ID
+            let deviceParam = "";
+            try {
+              const devResp = await fetch("https://api.spotify.com/v1/me/player/devices", {
+                headers: { Authorization: `Bearer ${token}` },
+              });
+              if (devResp.ok) {
+                const devData = await devResp.json();
+                const devices = devData?.devices || [];
+                const activeDev = devices.find((d) => d.is_active) || devices[0];
+                if (activeDev?.id) {
+                  deviceParam = `?device_id=${encodeURIComponent(activeDev.id)}`;
+                }
+              }
+            } catch {
+              // ignore
+            }
+
+            const playResp = await fetch(
+              `https://api.spotify.com/v1/me/player/play${deviceParam}`,
+              {
+                method: "PUT",
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ uris: [trackUri] }),
+              }
+            );
+            if (playResp.status === 204 || playResp.ok) {
+              return {
+                ok: true,
+                officialSongName: trackTitle,
+                officialArtist: trackArtist,
+                address: trackUri,
+                message: `Identified "${trackTitle}" by ${trackArtist} via YouTube and playing it on your Windows Spotify app.`,
+              };
+            }
+          }
+        }
+
+        // Step 3B: Open directly in the native Windows Spotify Desktop App via spotify:track:<id> URI and trigger playback!
+        const nativeUri = trackUri || `spotify:search:${encodeURIComponent(spotifyQuery)}`;
+        await shell.openExternal(nativeUri);
+
+        // Wait briefly for the Windows Spotify Desktop App to focus the track, then press Enter to start playback immediately
+        const autoPlayPs = `
+Start-Sleep -Milliseconds 1400
+$wshell = New-Object -ComObject WScript.Shell
+if ($wshell.AppActivate("Spotify")) {
+  Start-Sleep -Milliseconds 250
+  $wshell.SendKeys("~")
+}
+`;
+        runPowerShell(autoPlayPs, 4000);
+
+        return {
+          ok: true,
+          inputLyrics: rawLyricsOrQuery,
+          youtubeMatch: resolved.youtubeTitle,
+          officialSongName: trackTitle,
+          officialArtist: trackArtist,
+          address: nativeUri,
+          message: `Found official song "${trackTitle}"${trackArtist ? " by " + trackArtist : ""} via YouTube and playing it in your Windows Spotify app.`,
+        };
+      } catch (err) {
+        return { ok: false, error: err.message };
+      }
+    }
+
+    case "connect_spotify": {
+      if (args.clientId && args.clientSecret) {
+        fs.writeFileSync(
+          SPOTIFY_CONFIG_FILE,
+          JSON.stringify({ clientId: args.clientId, clientSecret: args.clientSecret }, null, 2),
+          "utf8"
+        );
+      }
+      return startSpotifyOAuthServer();
     }
 
     case "close_app": {
@@ -733,11 +1728,58 @@ $w = New-Object -ComObject WScript.Shell
 
     case "media_control": {
       const cmd = String(args.command || "play_pause").toLowerCase();
+
+      // 1. Try Spotify Premium Web API first if user OAuth token is connected
+      try {
+        const { token, isUserToken } = await getSpotifyAccessToken();
+        if (isUserToken && token) {
+          if (cmd === "pause" || cmd === "stop") {
+            const r = await fetch("https://api.spotify.com/v1/me/player/pause", {
+              method: "PUT",
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            if (r.status === 204 || r.ok) {
+              return { ok: true, message: "Paused Spotify playback." };
+            }
+          } else if (cmd === "play" || cmd === "resume") {
+            const r = await fetch("https://api.spotify.com/v1/me/player/play", {
+              method: "PUT",
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            if (r.status === 204 || r.ok) {
+              return { ok: true, message: "Resumed Spotify playback." };
+            }
+          } else if (cmd === "next") {
+            const r = await fetch("https://api.spotify.com/v1/me/player/next", {
+              method: "POST",
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            if (r.status === 204 || r.ok) {
+              return { ok: true, message: "Skipped to next Spotify track." };
+            }
+          } else if (cmd === "previous") {
+            const r = await fetch("https://api.spotify.com/v1/me/player/previous", {
+              method: "POST",
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            if (r.status === 204 || r.ok) {
+              return { ok: true, message: "Returned to previous Spotify track." };
+            }
+          }
+        }
+      } catch {
+        // fall through to Windows OS Media Keys
+      }
+
+      // 2. Native Windows OS Media Keys (controls Windows Spotify Desktop App & system media)
       const keyMap = {
         play_pause: 179,
+        play: 179,
+        resume: 179,
+        pause: 179,
         next: 176,
         previous: 177,
-        stop: 178,
+        stop: 179,
       };
       const charCode = keyMap[cmd] || 179;
       await runPowerShell(`$w = New-Object -ComObject WScript.Shell; $w.SendKeys([char]${charCode})`, 3000);
@@ -747,6 +1789,62 @@ $w = New-Object -ComObject WScript.Shell
     case "lock_workstation": {
       await runPowerShell(`rundll32.exe user32.dll,LockWorkStation`, 3000);
       return { ok: true, message: "Workstation locked." };
+    }
+
+    case "get_globe_news": {
+      const topic = String(args.topic || args.query || "").trim();
+      const lang = String(args.languageCode || "en-IN");
+      try {
+        return await crawlAndSynthesizeNewsStory(topic, lang);
+      } catch (err) {
+        return { ok: false, error: err.message };
+      }
+    }
+
+    case "watch_news_topic": {
+      const topic = String(args.topic || args.query || "").trim();
+      const languageCode = String(args.languageCode || "en-IN");
+      if (!topic) return { ok: false, message: "No news topic specified to watch." };
+
+      // Remove existing duplicate watch for same topic if present
+      newsWatches = newsWatches.filter((w) => w.topic.toLowerCase() !== topic.toLowerCase());
+
+      const newWatch = {
+        id: `watch-${Date.now()}`,
+        topic,
+        languageCode,
+        seenIds: [],
+        createdAt: formatFullTimestamp(new Date()),
+      };
+      newsWatches.push(newWatch);
+      saveNewsWatches();
+
+      // Trigger first live Azure Globe News scan 9 seconds after user's command finishes
+      // so the orb proactively blooms and informs the user as soon as a matching story is found!
+      setTimeout(() => {
+        checkNewsWatchesAndNotify(newWatch.id).catch(() => {});
+      }, 9500);
+
+      return {
+        ok: true,
+        topic,
+        watchId: newWatch.id,
+        message: `Monitoring Azure Globe News 24/7 for "${topic}". I will proactively alert you the moment news breaks on "${topic}".`,
+      };
+    }
+
+    case "unwatch_news_topic": {
+      const topic = String(args.topic || "").trim().toLowerCase();
+      if (!topic || topic === "all") {
+        newsWatches = [];
+      } else {
+        newsWatches = newsWatches.filter((w) => !w.topic.toLowerCase().includes(topic));
+      }
+      saveNewsWatches();
+      return {
+        ok: true,
+        message: topic ? `Stopped watching news alerts for "${topic}".` : "Cleared all Globe News watches.",
+      };
     }
 
     case "web_search": {
@@ -1777,6 +2875,17 @@ app.whenReady().then(() => {
   startWakeWordWorker();
   getVertexCredentials().catch(() => {});
   createMainWindow();
+
+  // If Spotify Developer credentials exist and user hasn't authorized yet, open one-time OAuth consent
+  if (fs.existsSync(SPOTIFY_CONFIG_FILE) && !fs.existsSync(SPOTIFY_TOKEN_FILE)) {
+    setTimeout(() => {
+      try {
+        startSpotifyOAuthServer();
+      } catch {
+        // ignore
+      }
+    }, 1500);
+  }
 
   // Register global Windows shortcuts to summon J.A.R.V.I.S.
   try {

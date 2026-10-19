@@ -150,16 +150,15 @@ class HeyJarvisTFLiteModel:
         logit1 = float((h2 @ self.W3.T + self.b3)[0, 0])
         s1 = float(1.0 / (1.0 + np.exp(-np.clip(logit1, -40.0, 40.0))))
 
-        if s1 >= 0.45:
+        if s1 >= 0.05:
             z1 = np.maximum(0.0, self._layer_norm(x @ self.s2_W1.T + self.s2_b1, self.s2_g1, self.s2_bt1))
             z2 = np.maximum(0.0, self._layer_norm(z1 @ self.s2_W2.T + self.s2_b2, self.s2_g2, self.s2_bt2))
             logit2 = float((z2 @ self.s2_W3.T + self.s2_b3)[0, 0])
             s2 = float(1.0 / (1.0 + np.exp(-np.clip(logit2, -40.0, 40.0))))
-            # Both Stage 1 and Stage 2 Verifier must agree to reject course/YouTube video rhymes
-            combined = min(s1, s2) if s2 < 0.35 else (0.4 * s1 + 0.6 * s2)
+            combined = max(s2, s1 * 0.85)
             return combined, s1, True
 
-        return s1 * 0.5, s1, False
+        return s1, s1, False
 
     def predict(self, emb_history: np.ndarray) -> tuple[float, float, bool]:
         """

@@ -104,5 +104,103 @@ describe("J.A.R.V.I.S. Windows Fast Intent Router", () => {
     const codexSite = parseLocalFastIntent("use codex to create a coffee shop landing page");
     expect(codexSite?.tool).toBe("coding_agent");
     expect(codexSite?.args.agent).toBe("codex");
+
+    expect(parseLocalFastIntent("Play the song that goes kesariya tera ishq hai piya on Spotify")).toEqual({
+      tool: "play_spotify",
+      args: { query: "kesariya tera ishq hai piya" },
+    });
+    expect(parseLocalFastIntent("Spotify pe kesariya tera ishq hai piya play karo")).toEqual({
+      tool: "play_spotify",
+      args: { query: "kesariya tera ishq hai piya" },
+    });
+    expect(parseLocalFastIntent("Connect my Spotify")).toEqual({
+      tool: "connect_spotify",
+      args: {},
+    });
+    expect(parseLocalFastIntent("If any news comes on Virat Kohli inform me")).toEqual({
+      tool: "watch_news_topic",
+      args: {
+        topic: "Virat Kohli",
+        languageCode: "en-IN",
+      },
+    });
+    expect(parseLocalFastIntent("अगर Bitcoin पर कोई news आए तो मुझे बताना")).toEqual({
+      tool: "watch_news_topic",
+      args: {
+        topic: "Bitcoin",
+        languageCode: "hi-IN",
+      },
+    });
+    expect(parseLocalFastIntent("What is the latest news on India?")).toEqual({
+      tool: "get_globe_news",
+      args: {
+        topic: "India",
+        languageCode: "en-IN",
+      },
+    });
+    expect(parseLocalFastIntent("Is there any news related to Tiger Shroff?")).toEqual({
+      tool: "get_globe_news",
+      args: {
+        topic: "Tiger Shroff",
+        languageCode: "en-IN",
+      },
+    });
+    expect(parseLocalFastIntent("Tiger Shroff News")).toEqual({
+      tool: "get_globe_news",
+      args: {
+        topic: "Tiger Shroff",
+        languageCode: "en-IN",
+      },
+    });
+    // Dangling incomplete sentence should NOT trigger Global/China news
+    expect(parseLocalFastIntent("Is there any news related to")).toBeNull();
+    expect(parseLocalFastIntent("Is there any latest news related to cockroach?")).toEqual({
+      tool: "get_globe_news",
+      args: {
+        topic: "cockroach",
+        languageCode: "en-IN",
+      },
+    });
   });
+
+  it("crawls 3 websites via Firecrawl, stores full content in news_temp_cache.json, and synthesizes a 'What Happened' story without URLs", async () => {
+    const mainCode = fs.readFileSync(path.resolve(process.cwd(), "electron/main.cjs"), "utf8");
+    const start = mainCode.indexOf("const GLOBE_NEWS_BASE_URL");
+    const end = mainCode.indexOf("async function checkNewsWatchesAndNotify");
+    const fn = new Function(
+      "fs",
+      "path",
+      "MEMORY_DIR",
+      "formatFullTimestamp",
+      "getVertexCredentials",
+      "getSarvamKey",
+      "memoryState",
+      "saveMemoryToDiskAsync",
+      `${mainCode.slice(start, end)}; return { crawlAndSynthesizeNewsStory, searchGlobeNews };`
+    );
+    const { crawlAndSynthesizeNewsStory } = fn(
+      fs,
+      path,
+      path.resolve(process.cwd(), "memory"),
+      () => new Date().toISOString(),
+      async () => ({ token: null, project: null }),
+      () => process.env.SARVAM_API_KEY || "sk_r19548c3_Z4nB2N2M87K6t5k1G7b9P2n3",
+      { addresses: {} },
+      () => {}
+    );
+
+    const res = await crawlAndSynthesizeNewsStory("Is there any news related to Tiger Shroff?", "en-IN");
+    expect(res.ok).toBe(true);
+    expect(res.websitesCount).toBeGreaterThanOrEqual(2);
+    expect(res.storyBriefing.toLowerCase()).toContain("tiger");
+    expect(res.storyBriefing).not.toMatch(/https?:\/\//i);
+
+    // Verify Temporary News Cache file was written with full multi-website content for follow-up Q&A
+    const cacheFile = path.resolve(process.cwd(), "memory/news_temp_cache.json");
+    expect(fs.existsSync(cacheFile)).toBe(true);
+    const cached = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+    expect(cached.topic).toBe("Tiger Shroff");
+    expect(cached.websites.length).toBeGreaterThanOrEqual(2);
+    expect(cached.websites[0].content.length).toBeGreaterThan(100);
+  }, 25000);
 });

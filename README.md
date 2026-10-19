@@ -56,8 +56,13 @@ While idle, J.A.R.V.I.S. remains **100% invisible and click-through** on your Wi
 - **Voice-to-Website Builder (`coding_agent`)**:
   - Say *"Hey Jarvis, build me a modern coffee shop website"* or *"Use Codex to create a portfolio landing page"*.
   - J.A.R.V.I.S. scaffolds `projects/<project-name>`, dispatches **Gemini CLI (`gemini --yolo -p "..."`)** or **OpenAI Codex CLI (`codex exec --full-auto "..."`)** in the background, opens the finished `index.html` in **Google Chrome**, and blooms up to announce completion.
-- **Direct Chrome & YouTube Automation (`play_youtube`, `open_address`)**:
-  - Say *"Open YouTube and play Barsaat song"* or *"YouTube pe Barsaat song chalao"* — resolves the top YouTube `videoId` and launches Chrome directly into playback (`watch?v=...&autoplay=1`).
+- **Direct Spotify Premium, Chrome & YouTube Automation (`play_spotify`, `play_youtube`, `open_address`)**:
+  - **Lyrics/Song → YouTube Data API v3 → Native Windows Spotify App (`play_spotify`)**: Sing or speak any lyrics or movie song name in English, Hindi, or Hinglish (e.g., *"Play the song that goes kesariya tera ishq hai piya"* or *"कोई मिल गया movie का song लगाओ Spotify में"*). J.A.R.V.I.S. resolves the official Romanized song title & artist via **Google Cloud YouTube Data API v3 (`videoCategoryId=10&regionCode=IN`)**, finds the exact `spotify:track:<id>` via the **Spotify Developer Web API (`/v1/search?market=IN`)**, and plays/pauses/skips directly inside your **native Windows Spotify Desktop App** via `/v1/me/player/play`.
+  - **Direct YouTube Playback (`play_youtube`)**: Say *"Open YouTube and play Barsaat song"* — resolves the official video ID and launches Chrome directly into playback (`watch?v=...&autoplay=1`).
+- **🌍 Azure Globe News API (`gdelt-timeline-proxy-rk2026`), Firecrawl 3-Site Story Crawler & Proactive Sentinel**:
+  - **Multi-Website Firecrawl Story Synthesis (`get_globe_news`)**: When you ask about any news topic (e.g., *"Is there any news related to Tiger Shroff?"*), J.A.R.V.I.S. uses **Firecrawl (`/v1/search`)** + **Azure Globe News (GDELT)** to crawl **2–3 news websites in parallel**, stores the full cleaned article bodies in a **Temporary News Cache (`memory/news_temp_cache.json`)**, and narrates a vivid 3–4 sentence **"What Happened" story** (never reading raw links or URLs aloud).
+  - **Follow-Up Q&A from Temp Cache**: Ask any follow-up question (*"How many rounds were fired?"*, *"Who visited him?"*, *"Was anyone injured?"*) and J.A.R.V.I.S. answers immediately from the cached 3-website article text.
+  - **Proactive Breaking-News Topic Sentinel (`watch_news_topic`)**: Say *"If any news comes on Virat Kohli, inform me"* or *"अगर Bitcoin पर कोई news आए तो मुझे बताना"* — J.A.R.V.I.S. monitors your topic in the background and automatically blooms the `SHDR-02` orb up to announce new stories as they break.
 - **Windows OS Control & Screen Vision**:
   - Launch/close apps, control master volume & media playback, lock workstation, capture screenshots for multimodal vision analysis, search the web, check live weather, and run PowerShell commands.
 - **Sub-Millisecond RAM-Indexed Persistent Memory**:

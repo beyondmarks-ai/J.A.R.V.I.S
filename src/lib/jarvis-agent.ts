@@ -80,6 +80,11 @@ ${FENCE}jarvis_tool
 ${FENCE}
 
 Available tools:
+- {"tool": "get_globe_news", "args": {"topic": "India or AI or Bidar or Global"}}
+- {"tool": "watch_news_topic", "args": {"topic": "Bitcoin or Virat Kohli or Dhurandhar", "languageCode": "en-IN|hi-IN"}}
+- {"tool": "unwatch_news_topic", "args": {"topic": "all or specific topic"}}
+- {"tool": "play_spotify", "args": {"query": "hummed or sung lyrics or song name"}}
+- {"tool": "connect_spotify", "args": {}}
 - {"tool": "coding_agent", "args": {"agent": "gemini|codex", "projectName": "portfolio-site", "prompt": "Detailed instructions of what website/app to build", "existingAddress": "optional path if modifying an existing project from memory"}}
 - {"tool": "open_address", "args": {"address": "D:\\\\Jarvis\\\\projects\\\\portfolio-site\\\\index.html", "openIn": "chrome|vscode|explorer"}}
 - {"tool": "play_youtube", "args": {"query": "Barsaat song"}}
@@ -113,29 +118,152 @@ export function detectCodeMixLanguage(text: string, fallback = "en-IN"): string 
   return fallback || "en-IN";
 }
 
+const TOPIC_STOPWORDS = new Set([
+  "hey", "hi", "ok", "okay", "jarvis", "sir", "please",
+  "is", "there", "are", "was", "were", "be", "do", "does", "did", "can", "could", "will", "would",
+  "any", "some", "the", "a", "an", "what", "whats", "what's", "tell", "me", "give", "show", "check", "find", "get",
+  "latest", "breaking", "recent", "new", "current", "today", "todays", "today's", "right", "now",
+  "globe", "news", "update", "updates", "headline", "headlines", "story", "stories", "report", "reports",
+  "related", "relating", "regarding", "concerning", "connected", "about", "on", "in", "from", "for", "of", "to", "with", "by",
+  "if", "when", "whenever", "comes", "come", "coming", "happens", "happening", "inform", "notify", "alert", "watch", "monitor", "track", "let", "know", "then",
+  "हे", "जार्विस", "अरे", "यार", "क्या", "कोई", "भी", "है", "हैं", "में", "पर", "पे", "की", "का", "के", "को", "से", "तो",
+  "अगर", "जब", "खबर", "खबरें", "न्यूज़", "समाचार", "ताज़ा", "आज", "मुझे", "बताना", "बता", "देना", "बताओ", "सुनाओ", "इंफॉर्म", "करना", "करो", "अलर्ट", "लेकर", "बारे", "आए", "आता", "आती", "मिले",
+]);
+
+function extractCleanTopicFromSentence(sentence: string): string {
+  const tokens = sentence
+    .replace(/[।?!.,;:"'()[\]{}]+/g, " ")
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 2 && !TOPIC_STOPWORDS.has(t.toLowerCase()));
+  return tokens.join(" ").trim();
+}
+
 export function parseLocalFastIntent(userText: string): {
   tool: string;
   args: Record<string, unknown>;
 } | null {
   const lower = userText.toLowerCase().trim();
 
-  // YouTube play intent (English + Hinglish/Multilingual)
-  const ytEnMatch = userText.match(
-    /(?:open\s+youtube\s+(?:and\s+)?play|play\s+on\s+youtube|youtube\s+(?:pe|par|per|on|में|पर|पे)\s+)(.+?)(?:\s+(?:play\s+karo|chalao|chala\s+do|lagao|baja\s+do|चलाओ|लगाओ|बजाओ|प्ले\s+करो))?$/i
-  );
-  if (ytEnMatch) {
-    const q = ytEnMatch[1]
-      .replace(/\b(play\s+karo|chalao|chala\s+do|lagao|on\s+youtube|in\s+chrome)\b/gi, "")
-      .replace(/(चलाओ|लगाओ|बजाओ|प्ले\s+करो)/g, "")
-      .trim();
-    if (q) return { tool: "play_youtube", args: { query: q } };
+  // Connect Spotify OAuth intent
+  if (/\b(?:connect|login|link|authorize)\s+(?:my\s+)?spotify\b/i.test(lower)) {
+    return { tool: "connect_spotify", args: {} };
   }
 
-  const playSongMatch = userText.match(
-    /^(?:hey\s+jarvis[,\s]*)?(?:please\s+)?play\s+(.+?)(?:\s+on\s+youtube)?$/i
-  );
-  if (playSongMatch && !/^(pause|resume|stop|next|previous)$/i.test(playSongMatch[1].trim())) {
-    return { tool: "play_youtube", args: { query: playSongMatch[1].trim() } };
+  // Stop / Pause / Resume / Next / Previous Spotify & Media Controls (English + Hinglish/Hindi)
+  if (
+    /^(?:hey\s+jarvis[,\s]*)?(?:please\s+)?(?:pause|stop)(?:\s+(?:the\s+)?(?:music|song|track|spotify|playback|audio|it))?$/i.test(
+      lower
+    ) ||
+    /\b(?:pause|stop)\s+(?:the\s+)?(?:music|song|track|spotify|playback|audio)\b/i.test(lower) ||
+    /\bspotify\s+(?:pause|stop|band\s+karo|rok\s+do|roko)\b/i.test(lower)
+  ) {
+    return { tool: "media_control", args: { command: "pause" } };
+  }
+  if (
+    /^(?:hey\s+jarvis[,\s]*)?(?:please\s+)?(?:resume|continue|unpause)(?:\s+(?:the\s+)?(?:music|song|track|spotify|playback|it))?$/i.test(
+      lower
+    ) ||
+    /\b(?:resume|continue|unpause)\s+(?:the\s+)?(?:music|song|track|spotify|playback)\b/i.test(lower)
+  ) {
+    return { tool: "media_control", args: { command: "resume" } };
+  }
+  if (/\b(next\s+track|next\s+song|skip\s+track|skip\s+song|agla\s+gaana)\b/i.test(lower)) {
+    return { tool: "media_control", args: { command: "next" } };
+  }
+  if (/\b(previous\s+track|previous\s+song|pichla\s+gaana)\b/i.test(lower)) {
+    return { tool: "media_control", args: { command: "previous" } };
+  }
+
+  // Stop watching news topic intent
+  if (
+    /\b(?:stop\s+watching|unwatch|clear|remove|cancel)\b.*\b(?:news|alert|alerts)\b/i.test(lower)
+  ) {
+    return { tool: "unwatch_news_topic", args: { topic: "all" } };
+  }
+
+  // Proactive News Topic Watch intent ("if any news comes on X inform me", "alert me when news comes about X", "अगर X पर कोई news आए तो मुझे बताना")
+  if (
+    /(?:\b(?:news|update|updates|story|headline)\b|खबर|खबरें|न्यूज़|समाचार)/i.test(userText) &&
+    /(?:\b(?:inform|notify|alert|let\s+me\s+know|watch|monitor|whenever)\b|बताना|बता\s+देना|इंफॉर्म|अलर्ट|जब\s+भी|अगर)/i.test(
+      userText
+    )
+  ) {
+    const cleanedTopic = extractCleanTopicFromSentence(userText);
+    if (cleanedTopic) {
+      return {
+        tool: "watch_news_topic",
+        args: {
+          topic: cleanedTopic,
+          languageCode: detectCodeMixLanguage(userText, "en-IN"),
+        },
+      };
+    }
+  }
+
+  // Live Globe News Query intent ("Is there any news related to Tiger Shroff?", "Tiger Shroff news", "what is the latest news on X", "आज की ताज़ा ख़बरें")
+  if (
+    /\b(?:news|headlines|headline)\b/i.test(lower) ||
+    /(?:ताज़ा\s+खबर|ताज़ा\s+खबरें|आज\s+की\s+खबर|न्यूज़|खबरें|खबर|समाचार)/.test(userText)
+  ) {
+    // Check if the user stopped mid-sentence after a preposition ("Is there any news related to", "news about", "news from")
+    if (/\b(?:related\s+to|about|regarding|from|on|for|in)\s*[?.!]*$/i.test(lower)) {
+      return null;
+    }
+    const cleanedNewsQuery = extractCleanTopicFromSentence(userText);
+    return {
+      tool: "get_globe_news",
+      args: {
+        topic: cleanedNewsQuery || "Global",
+        languageCode: detectCodeMixLanguage(userText, "en-IN"),
+      },
+    };
+  }
+
+  // Explicit YouTube play intent (only when user explicitly mentions YouTube)
+  if (/\byoutube\b|यूट्यूब/i.test(userText)) {
+    const cleanedYt = userText
+      .replace(/^(?:hey\s+jarvis|jarvis|हे\s+जार्विस|जार्विस)[,!.?\s]*/i, "")
+      .replace(
+        /\b(?:open\s+youtube\s+and\s+play|play\s+on\s+youtube|on\s+youtube|youtube\s+(?:pe|par|per|on)|play\s+karo|chalao|chala\s+do|lagao|baja\s+do|please|play|youtube)\b/gi,
+        " "
+      )
+      .replace(/(?:यूट्यूब|चलाओ|लगाओ|बजाओ|प्ले\s+करो|प्ले|में|पर|पे)/g, " ")
+      .replace(/[।.?!]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (cleanedYt) return { tool: "play_youtube", args: { query: cleanedYt } };
+  }
+
+  // Spotify / Lyrics / Movie Song / Hindi & English Song Play Intent -> Resolves via YouTube API & plays in Windows Spotify App!
+  if (
+    /\bspotify\b|स्पॉटिफाई/i.test(userText) ||
+    /^(?:hey\s+jarvis[,\s]*)?(?:please\s+)?(?:play|प्ले)\s+/i.test(userText) ||
+    /(?:\b(?:song|gaana|music|track)\b|गाना|सॉन्ग).*(?:\b(?:play|chalao|chala\s+do|lagao|baja\s+do)\b|चलाओ|लगाओ|बजाओ|प्ले)/i.test(
+      userText
+    ) ||
+    /(?:ये\s+गाना\s+चलाओ|वो\s+गाना\s+चलाओ|गाना\s+चलाओ|गाना\s+लगाओ)/i.test(userText)
+  ) {
+    const cleanedSongQuery = userText
+      .replace(/^(?:hey\s+jarvis|jarvis|हे\s+जार्विस|जार्विस)[,!.?\s]*/i, "")
+      .replace(
+        /\b(?:open\s+spotify\s+and\s+play|play\s+the\s+song\s+that\s+goes|play\s+that\s+song\s+that\s+goes|play\s+the\s+song|play\s+on\s+spotify|on\s+spotify|in\s+spotify|spotify\s+(?:pe|par|per|on|mein|me)|play\s+karo|chalao|chala\s+do|lagao|laga\s+do|baja\s+do|please|play|spotify)\b/gi,
+        " "
+      )
+      .replace(
+        /(?:स्पॉटिफाई\s*(?:में|पर|पे)?|लगाओ|लगा\s+दो|चलाओ|चला\s+दो|बजाओ|प्ले\s+करो|प्ले|ये\s+गाना|वो\s+गाना|में|पर|पे)/g,
+        " "
+      )
+      .replace(/[।.?!]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (
+      cleanedSongQuery &&
+      !/^(?:pause|resume|stop|next|previous|music)$/i.test(cleanedSongQuery)
+    ) {
+      return { tool: "play_spotify", args: { query: cleanedSongQuery } };
+    }
   }
 
   // Gemini CLI / Codex CLI website or app builder intent
@@ -317,8 +445,13 @@ export async function processJarvisTurn(params: {
     const fastLang = detectCodeMixLanguage(userText, detectedLanguage);
     const isHindi = fastLang === "hi-IN" || fastLang === "mr-IN";
 
-    // Instant zero-LLM-latency response for direct OS, YouTube, and CLI builder commands!
+    // Instant zero-LLM-latency response for direct OS, YouTube, Spotify, Globe News, and CLI builder commands!
     const instantTools = new Set([
+      "get_globe_news",
+      "watch_news_topic",
+      "unwatch_news_topic",
+      "play_spotify",
+      "connect_spotify",
       "play_youtube",
       "launch_app",
       "set_volume",
@@ -331,10 +464,36 @@ export async function processJarvisTurn(params: {
 
     if (instantTools.has(fastIntent.tool) && fastRes?.ok !== false) {
       let instantReply = String(("message" in fastRes ? fastRes.message : "") || "Done, sir.");
-      if (fastIntent.tool === "play_youtube") {
+      const officialSong =
+        ("officialSongName" in fastRes && fastRes.officialSongName
+          ? String(fastRes.officialSongName)
+          : String(fastIntent.args.query || ""));
+      const officialArtist =
+        "officialArtist" in fastRes && fastRes.officialArtist
+          ? ` by ${fastRes.officialArtist}`
+          : "";
+
+      if (fastIntent.tool === "watch_news_topic") {
+        const watchedTopic = String(fastIntent.args.topic || "");
         instantReply = isHindi
-          ? `बिल्कुल sir, मैं अभी Chrome में YouTube पर ${fastIntent.args.query} play कर रहा हूँ।`
-          : `Right away, sir. Playing ${fastIntent.args.query} on YouTube in Chrome.`;
+          ? `बिल्कुल sir, मैंने Azure Globe News पर "${watchedTopic}" के लिए live alert लगा दिया है। जैसे ही इस पर कोई नई खबर आएगी, मैं खुद आपको तुरंत inform करूँगा।`
+          : `Right away, sir. I am now monitoring Azure Globe News for "${watchedTopic}" and will inform you immediately when a story breaks.`;
+      } else if (fastIntent.tool === "get_globe_news") {
+        const story =
+          "storyBriefing" in fastRes && fastRes.storyBriefing
+            ? String(fastRes.storyBriefing)
+            : String(("message" in fastRes ? fastRes.message : "") || "");
+        if (story) {
+          instantReply = story;
+        }
+      } else if (fastIntent.tool === "play_spotify") {
+        instantReply = isHindi
+          ? `बिल्कुल sir, मैंने YouTube से "${officialSong}"${officialArtist} identify कर लिया है और Spotify पर play कर रहा हूँ।`
+          : `Right away, sir. Identified "${officialSong}"${officialArtist} via YouTube and playing it on Spotify.`;
+      } else if (fastIntent.tool === "play_youtube") {
+        instantReply = isHindi
+          ? `बिल्कुल sir, मैं अभी Chrome में YouTube पर ${officialSong} play कर रहा हूँ।`
+          : `Right away, sir. Playing ${officialSong}${officialArtist} on YouTube in Chrome.`;
       } else if (fastIntent.tool === "launch_app") {
         instantReply = isHindi
           ? `बिल्कुल sir, मैंने ${fastIntent.args.app} open कर दिया है।`

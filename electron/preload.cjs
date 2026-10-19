@@ -33,6 +33,13 @@ contextBridge.exposeInMainWorld("jarvisHost", {
     return () => ipcRenderer.removeListener("jarvis:agentComplete", listener);
   },
 
+  // Proactive Azure Globe News topic alert event
+  onNewsAlert: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on("jarvis:newsAlert", listener);
+    return () => ipcRenderer.removeListener("jarvis:newsAlert", listener);
+  },
+
   // Multi-Provider AI Brain & Auth
   aiChat: (payload) => ipcRenderer.invoke("ai:chat", payload),
   transcribeAudio: (payload) => ipcRenderer.invoke("voice:transcribe", payload),

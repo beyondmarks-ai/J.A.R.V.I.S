@@ -64,6 +64,8 @@ export default function App() {
     lastSpeechAt: number;
     peakRms: number;
     flushed: boolean;
+    liveTranscript: string;
+    liveLang: string;
     alreadyPromptedYesSir: boolean;
     processing: boolean;
   }>({
@@ -73,6 +75,8 @@ export default function App() {
     lastSpeechAt: 0,
     peakRms: 0.04,
     flushed: false,
+    liveTranscript: "",
+    liveLang: "en-IN",
     alreadyPromptedYesSir: false,
     processing: false,
   });
@@ -120,6 +124,17 @@ export default function App() {
           projectDir: string;
           address: string;
           completedAt: string;
+        }) => void
+      ) => () => void;
+      onNewsAlert?: (
+        cb: (data: {
+          watchId: string;
+          topic: string;
+          headline: string;
+          place: string;
+          source: string;
+          url: string;
+          languageCode: string;
         }) => void
       ) => () => void;
       onGlobalSummon?: (cb: (data: { trigger: string }) => void) => () => void;
@@ -173,6 +188,8 @@ export default function App() {
     if (!host?.onAgentComplete) return;
     return host.onAgentComplete(async ({ agent, projectName }) => {
       if (isBusyRef.current || commandListenRef.current) return;
+      isBusyRef.current = true;
+      agentSpeakingRef.current = true;
       showOrbSiri();
       setOrbState("speaking");
       const msg = `Sir, ${agent.toUpperCase()} CLI has finished building your ${projectName.replace(/-/g, " ")} project and I have opened it in Chrome.`;
@@ -183,8 +200,54 @@ export default function App() {
         sarvamApiKey: aiConfig.sarvamApiKey,
         onStart: () => setOrbState("speaking"),
         onVolume: (v) => setAgentVolume(v),
-        onEnd: () => setAgentVolume(0),
+        onEnd: () => {
+          agentSpeakingRef.current = false;
+          postSpeakMuteUntilRef.current = Date.now() + 500;
+          setAgentVolume(0);
+        },
       });
+      agentSpeakingRef.current = false;
+      postSpeakMuteUntilRef.current = Date.now() + 500;
+      isBusyRef.current = false;
+      dismissOrbSiri();
+    });
+  }, [aiConfig.sarvamApiKey, aiConfig.sarvamSpeaker, aiConfig.voiceRate, dismissOrbSiri, host, showOrbSiri]);
+
+  // Proactive Azure Globe News Sentinel Alert: blooms the orb & speaks breaking news on watched topics
+  useEffect(() => {
+    if (!host?.onNewsAlert) return;
+    return host.onNewsAlert(async ({ topic, headline, languageCode }) => {
+      if (isBusyRef.current || commandListenRef.current) return;
+      isBusyRef.current = true;
+      agentSpeakingRef.current = true;
+      showOrbSiri();
+      audioEngineRef.current.playWakeChime();
+      setOrbState("speaking");
+
+      const isHindi = languageCode === "hi-IN" || languageCode === "mr-IN";
+      const alertSpeech = isHindi
+        ? `Excuse me sir, Azure Globe News पर ${topic} को लेकर एक नई खबर आई है: ${headline}.`
+        : `Excuse me, sir. Breaking update on ${topic} from Azure Globe News: ${headline}.`;
+
+      await audioEngineRef.current.speak(alertSpeech, {
+        rate: aiConfig.voiceRate,
+        speaker: aiConfig.sarvamSpeaker || "shubh",
+        languageCode: languageCode || "en-IN",
+        sarvamApiKey: aiConfig.sarvamApiKey,
+        onStart: () => {
+          agentSpeakingRef.current = true;
+          setOrbState("speaking");
+        },
+        onVolume: (v) => setAgentVolume(v),
+        onEnd: () => {
+          agentSpeakingRef.current = false;
+          postSpeakMuteUntilRef.current = Date.now() + 500;
+          setAgentVolume(0);
+        },
+      });
+      agentSpeakingRef.current = false;
+      postSpeakMuteUntilRef.current = Date.now() + 500;
+      isBusyRef.current = false;
       dismissOrbSiri();
     });
   }, [aiConfig.sarvamApiKey, aiConfig.sarvamSpeaker, aiConfig.voiceRate, dismissOrbSiri, host, showOrbSiri]);
@@ -296,6 +359,8 @@ export default function App() {
         lastSpeechAt: now,
         peakRms: Math.max(noiseFloorRef.current * 2.2, 0.035),
         flushed: false,
+        liveTranscript: "",
+        liveLang: "en-IN",
         alreadyPromptedYesSir: alreadyPrompted,
         processing: false,
       };
@@ -312,7 +377,7 @@ export default function App() {
     [aiConfig.sarvamApiKey, host]
   );
 
-  // Listen for instant (~54ms) live WebSocket transcript from Sarvam saaras:v3 server-side neural VAD
+  // Listen for live WebSocket transcripts from Sarvam saaras:v3, accumulating clauses if user pauses mid-sentence!
   useEffect(() => {
     if (!host?.onSarvamSttEvent) return;
     return host.onSarvamSttEvent(async (ev) => {
@@ -322,22 +387,38 @@ export default function App() {
       if (ev.type === "START_SPEECH" && elapsed > 320) {
         vadStateRef.current.hasSpoken = true;
         vadStateRef.current.lastSpeechAt = Date.now();
-      } else if (ev.type === "END_SPEECH" && vadStateRef.current.hasSpoken && elapsed > 700) {
-        // Server-side neural VAD detected end of user speech — flush immediately!
-        host.sarvamSttFlush?.().catch(() => {});
+        vadStateRef.current.flushed = false;
       } else if (ev.type === "TRANSCRIPT") {
-        const cleanedCommand = (ev.text || "")
+        const piece = (ev.text || "")
           .replace(
             /^(?:hey\s+jarvis|hi\s+jarvis|ok\s+jarvis|jarvis|हे\s+जार्विस|हे\s+जर्विस|यार\s+जार्विस|यार\s+जर्विस|जार्विस|जर्विस)[,!.?\s]*/i,
             ""
           )
           .trim();
 
+        if (piece && piece !== "WAKE_ONLY" && piece !== "EMPTY") {
+          vadStateRef.current.liveTranscript = vadStateRef.current.liveTranscript
+            ? `${vadStateRef.current.liveTranscript} ${piece}`.trim()
+            : piece;
+          if (ev.languageCode) {
+            vadStateRef.current.liveLang = ev.languageCode;
+          }
+        }
+
+        const fullText = vadStateRef.current.liveTranscript;
+        const silenceDuration = Date.now() - vadStateRef.current.lastSpeechAt;
+        // Check if sentence ends with an incomplete dangling word (e.g. "Is there any news related to...")
+        const isDanglingIncomplete =
+          /\b(?:to|from|about|on|in|for|with|of|by|that| goes|related\s+to|play|open|search)\s*[?.!]*$/i.test(
+            fullText
+          ) || /(?:पर|में|का|की|के|को|से)\s*[।?.!]*$/.test(fullText);
+
+        // Only execute immediately from WebSocket if we already flushed after real silence AND sentence is complete!
         if (
-          cleanedCommand &&
-          cleanedCommand !== "WAKE_ONLY" &&
-          cleanedCommand !== "EMPTY" &&
-          cleanedCommand.length >= 2
+          fullText.length >= 2 &&
+          vadStateRef.current.flushed &&
+          silenceDuration >= 1000 &&
+          (!isDanglingIncomplete || silenceDuration >= 2000)
         ) {
           vadStateRef.current.processing = true;
           commandListenRef.current = false;
@@ -346,7 +427,7 @@ export default function App() {
           host.sarvamSttStop?.().catch(() => {});
           host.wakewordReset?.().catch(() => {});
           vadStateRef.current.processing = false;
-          await handleUserCommandRef.current(cleanedCommand, ev.languageCode || "en-IN");
+          await handleUserCommandRef.current(fullText, vadStateRef.current.liveLang);
         }
       }
     });
@@ -373,9 +454,9 @@ export default function App() {
     setOrbState("thinking");
 
     try {
-      let transcribed = "";
-      let detectedLang = "en-IN";
-      if (host?.transcribeAudio && (hadSpeech || chunks.length >= 6)) {
+      let transcribed = vadStateRef.current.liveTranscript.trim();
+      let detectedLang = vadStateRef.current.liveLang || "en-IN";
+      if (!transcribed && host?.transcribeAudio && (hadSpeech || chunks.length >= 6)) {
         const wavBase64 = encodeWavBase64FromChunks(chunks, 16000);
         const sttRes = await host.transcribeAudio({
           wavBase64,
@@ -501,12 +582,7 @@ export default function App() {
           }
           const b64 = int16ToBase64(merged);
           const res = await host.wakewordSendPcm(b64);
-          if (
-            typeof res?.score === "number" &&
-            res.score >= 0.52 &&
-            res.stage2Verified &&
-            !commandListenRef.current
-          ) {
+          if (typeof res?.score === "number" && res.score >= 0.22 && !commandListenRef.current) {
             pendingWakeQueue.length = 0;
             triggerWakeActivation();
             break;
@@ -527,7 +603,7 @@ export default function App() {
             channelCount: 1,
             echoCancellation: true,
             noiseSuppression: true,
-            autoGainControl: false,
+            autoGainControl: true,
           },
         });
         if (cancelled) {
@@ -575,7 +651,7 @@ export default function App() {
           }
 
           const rawRms = Math.sqrt(sumSq / floatSamples.length);
-          const visualRms = Math.min(1, rawRms * 5.5);
+          const visualRms = Math.min(1, rawRms * 6.0);
           setMicVolume(visualRms);
 
           // Mode A: Recording & Live-Streaming User's Spoken Command to Sarvam saaras:v3 WebSocket
@@ -584,15 +660,15 @@ export default function App() {
             const now = Date.now();
             const elapsed = now - vadStateRef.current.startedAt;
 
-            // Skip the first 320ms while the wake chime plays so chime audio never enters STT
-            if (elapsed <= 320) {
+            // Skip the first 300ms while the wake chime plays so chime audio never enters STT
+            if (elapsed <= 300) {
               return;
             }
 
-            // Near-field human voice threshold (ignores faint PC speaker bleed)
-            const minSpeechRms = Math.max(noiseFloorRef.current * 3.0, 0.032);
+            // Relative-to-Peak Speech Detection: adapts to user's voice peak and drops immediately when user stops talking
+            const minSpeechRms = Math.max(noiseFloorRef.current * 2.2, 0.022);
             const dynamicThreshold = vadStateRef.current.hasSpoken
-              ? Math.max(minSpeechRms, vadStateRef.current.peakRms * 0.32)
+              ? Math.max(minSpeechRms, vadStateRef.current.peakRms * 0.28)
               : minSpeechRms;
 
             const isSpeechFrame = rawRms > dynamicThreshold;
@@ -608,8 +684,8 @@ export default function App() {
               }
             }
 
-            // Do NOT dynamically boost faint audio (which boosts PC speaker bleed); gate non-speech to 0
-            const gain = isSpeechFrame ? 1.15 : 0.0;
+            // Keep natural 1.45x gain during speech and natural pauses so Sarvam never cuts off mid-sentence
+            const gain = 1.45;
 
             for (let i = 0; i < floatSamples.length; i++) {
               const s = Math.max(-1, Math.min(1, floatSamples[i] * gain));
@@ -624,16 +700,16 @@ export default function App() {
             }
 
             const silenceDuration = now - vadStateRef.current.lastSpeechAt;
-            // At 500ms of silence after speaking, flush the open Sarvam WebSocket immediately!
-            if (vadStateRef.current.hasSpoken && silenceDuration > 500 && !vadStateRef.current.flushed) {
+            // Wait 1150ms of real silence after speaking before flushing so natural pauses ("related to ... Tiger Shroff") are never cut off!
+            if (vadStateRef.current.hasSpoken && silenceDuration > 1150 && !vadStateRef.current.flushed) {
               vadStateRef.current.flushed = true;
               host?.sarvamSttFlush?.().catch(() => {});
             }
 
-            // Finalize at 780ms after last word if WebSocket didn't already resolve via onSarvamSttEvent
-            const finishedSpeaking = vadStateRef.current.hasSpoken && silenceDuration > 780;
-            const maxTimeReached = elapsed > 18000;
-            const noSpeechTimeout = !vadStateRef.current.hasSpoken && elapsed > 4000;
+            // Finalize at 1450ms after last word if WebSocket didn't already resolve via onSarvamSttEvent
+            const finishedSpeaking = vadStateRef.current.hasSpoken && silenceDuration > 1450;
+            const maxTimeReached = elapsed > 20000;
+            const noSpeechTimeout = !vadStateRef.current.hasSpoken && elapsed > 5000;
 
             if (finishedSpeaking || maxTimeReached || noSpeechTimeout) {
               finalizeVoiceRecordingRef.current();
@@ -642,12 +718,12 @@ export default function App() {
           }
 
           // Update ambient noise floor estimate while idle
-          if (!isBusyRef.current && rawRms > 0.0005 && rawRms < 0.05) {
-            noiseFloorRef.current = noiseFloorRef.current * 0.9 + rawRms * 0.1;
+          if (!isBusyRef.current && rawRms > 0.0005 && rawRms < 0.04) {
+            noiseFloorRef.current = noiseFloorRef.current * 0.92 + rawRms * 0.08;
           }
 
           for (let i = 0; i < floatSamples.length; i++) {
-            const s = Math.max(-1, Math.min(1, floatSamples[i]));
+            const s = Math.max(-1, Math.min(1, floatSamples[i] * 1.35));
             pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
           }
 
