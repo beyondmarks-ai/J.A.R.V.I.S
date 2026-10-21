@@ -154,3 +154,10 @@ npm start
 
 - **Shader (`SHDR-02` / Rocaille)**: Original GLSL shader by [XorDev](https://x.com/XorDev), ported for [OrbKit](https://github.com/zzzzshawn/orbkit) by `@zzzzshawn`.
 - **Wake Word Model**: `hey_jarvis_v0.1.tflite` from [OpenWakeWord](https://github.com/dscripka/openWakeWord).
+
+<!-- beyond-marks-credit:start -->
+---
+### Built by Beyond Marks AI Academy
+
+Developed by **Rakesh Kumar** at [Beyond Marks AI Academy](https://beyondmarks.ai).
+<!-- beyond-marks-credit:end -->
